@@ -464,9 +464,13 @@ def main():
       rmi.record_type_code||rmi.record_num AS "ItemNum",
       ip.barcode AS "Barcode",
       rmb.record_type_code||rmb.record_num AS "BibNum",
-      rmp.record_type_code||rmp.record_num AS "PatronNum",
+	  CASE
+		  WHEN TRIM(t.patron_home_library_code) IN ('cml','brr')
+		  THEN rmp.record_type_code || rmp.record_num
+		  ELSE '-'
+	  END AS "PatronNum",
       TO_CHAR(t.transaction_gmt, 'YYYY-MM-DD HH24:MI:SS') AS "CheckoutDate",
-      SUBSTRING(sg.location_code,1,3) AS "BranchCodeNum",
+      SUBSTRING(sg.location_code,1,3) AS "TransactionBranchCodeNum",
       --translate operation codes
       CASE
         WHEN t.op_code = 'r' THEN 'RENEWAL'
@@ -497,9 +501,12 @@ def main():
 
     --limit to checkouts, renewals and internal use transaction within the past 4 days
     WHERE t.op_code IN ('o','r','u')
-    --Limit to transactions from Curtis and Brewer
-      AND t.stat_group_code_num IN ('830','100','101','102','103','104','105','107')
       AND t.transaction_gmt::DATE > CURRENT_DATE - INTERVAL '4 days'
+		AND (
+		      t.patron_home_library_code IN ('cml','brr')
+		      OR LEFT(i.location_code,3) IN ('cml','brr')
+		      OR LEFT(sg.location_code,3) IN ('cml','brr')
+		)
     """
 
     fulfilled_holds_query = """\
