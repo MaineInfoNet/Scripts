@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # Run in sic
 
-"""
-Dirigo Monthly Export & Upload to PRM
-Lynn Uhlman - Maine InfoNet
-"""
+# ---------------------------
+# Dirigo Monthly Export & Upload to PRM
+# Lynn Uhlman - Maine InfoNet
+# ---------------------------
 
 import os
 import csv
