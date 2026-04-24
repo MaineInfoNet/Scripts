@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-# Run in sic
 
 import os
-import csv
 import base64
 import shutil
 import pyodbc
@@ -12,6 +10,8 @@ import requests
 import logging
 from requests_ntlm import HttpNtlmAuth
 from datetime import date, timedelta
+import warnings
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy")
 
 # ----------------------------
 # Paths
@@ -25,7 +25,6 @@ ARCHIVE_DIR = os.path.join(REPORTS_DIR, "old")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-
 # ----------------------------
 # Logging
 # ----------------------------
@@ -37,11 +36,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(console)
 
 # ----------------------------
 # Config
@@ -56,45 +50,96 @@ USERNAME = config["ssrs"]["username"]
 PASSWORD = config["ssrs"]["password"]
 
 # ----------------------------
-# CSV Writer
+# Load Pricing Excel
 # ----------------------------
 
-def csv_writer(rows, headers, csv_file):
-    with open(csv_file, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerows(rows)
-    logger.info(f"CSV written: {csv_file}")
+PRICE_XLSX = os.path.join(BASE_DIR, "mils_roi.xlsx")
+
+price_df = pd.read_excel(PRICE_XLSX, sheet_name="Prices")
+est_df = pd.read_excel(PRICE_XLSX, sheet_name="Est")
+
+price_df.columns = price_df.columns.str.strip()
+est_df.columns = est_df.columns.str.strip()
+
+# Lookup: (MaterialType, StatisticalCodeID)
+price_lookup = {
+    (
+        str(row["Mattype Description"]).strip(),
+        int(row["StatisticalCodeID"])
+    ): float(row["Price"])
+    for _, row in price_df.iterrows()
+    if pd.notnull(row["Price"])
+}
+
+# Fallback: MaterialType only
+est_lookup = {
+    str(row["Material Type"]).strip(): float(row["Est. Price"])
+    for _, row in est_df.iterrows()
+    if pd.notnull(row["Est. Price"])
+}
+
+# ----------------------------
+# Pricing Logic
+# ----------------------------
+
+def apply_pricing(df):
+
+    def get_price(row):
+        # Skip empty rows safely
+        if pd.isna(row["MaterialType"]) or pd.isna(row["StatisticalCodeID"]):
+            return None
+
+        try:
+            key = (
+                str(row["MaterialType"]).strip(),
+                int(row["StatisticalCodeID"])
+            )
+
+            if key in price_lookup:
+                return price_lookup[key]
+
+            if row["MaterialType"] in est_lookup:
+                return est_lookup[row["MaterialType"]]
+
+            return 10.00
+
+        except Exception as e:
+            print("Pricing error:", e, row)
+            return None
+
+    df = df.copy()
+
+    df.loc[:, "EstimatedPrice"] = df.apply(get_price, axis=1)
+
+    df = df.dropna(subset=["EstimatedPrice"]).copy()
+
+    df.loc[:, "EstimatedValueSaved"] = (
+        df["EstimatedPrice"] * df["TotalCheckouts"]
+)
+
+    return df
 
 # ----------------------------
 # Run Query
 # ----------------------------
 
-def run_query(query, csv_file):
+def run_query(query):
     conn = pyodbc.connect(SQL_CONNECTION)
-    cursor = conn.cursor()
-
-    cursor.execute(query)
-
-    headers = [column[0] for column in cursor.description]
-    rows = cursor.fetchall()
-
+    df = pd.read_sql(query, conn)
     conn.close()
-
-    csv_writer(rows, headers, csv_file)
+    return df
 
 # ----------------------------
-# CSV → XLSX
+# Save Outputs
 # ----------------------------
 
-def convert_csv_to_xlsx(csv_path):
-    base, _ = os.path.splitext(csv_path)
-    xlsx_path = base + ".xlsx"
+def save_outputs(df, csv_path):
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    xlsx_path = csv_path.replace(".csv", ".xlsx")
     df.to_excel(xlsx_path, index=False)
 
-    logger.info(f"Converted to XLSX: {xlsx_path}")
+    logger.info(f"Saved CSV + XLSX: {csv_path}")
     return xlsx_path
 
 # ----------------------------
@@ -118,8 +163,6 @@ def upload_file(session, file_path, folder_path):
     response = session.post(url, json=payload)
 
     logger.info(f"Upload response: {response.status_code}")
-    logger.info(response.text)
-
     return response.status_code in (200, 201, 409)
 
 # ----------------------------
@@ -127,14 +170,10 @@ def upload_file(session, file_path, folder_path):
 # ----------------------------
 
 def archive_file(file_path):
-    file_name = os.path.basename(file_path)
-    destination = os.path.join(ARCHIVE_DIR, file_name)
-
-    if os.path.exists(destination):
-        os.remove(destination)
-
-    shutil.move(file_path, destination)
-    logger.info(f"Archived {file_name}")
+    dest = os.path.join(ARCHIVE_DIR, os.path.basename(file_path))
+    if os.path.exists(dest):
+        os.remove(dest)
+    shutil.move(file_path, dest)
 
 # ----------------------------
 # Main
@@ -144,160 +183,126 @@ def main():
 
     logger.info("MILS export job started")
 
-    # Date
     today = date.today()
     first_of_this_month = today.replace(day=1)
     last_day_previous_month = first_of_this_month - timedelta(days=1)
     ym = last_day_previous_month.strftime("%Y%m")
 
-    # Queries
-    queries = {
-        "LibraryUseValue": """
-WITH TransactionData AS (
+    query = """
+WITH BaseTransactions AS (
+    SELECT DISTINCT
+        TH.TransactionID,
+        TH.OrganizationID,
+        TD.NumValue AS PatronCodeID
+    FROM PolarisTransactions.Polaris.TransactionDetails TD WITH (NOLOCK)
+
+    INNER JOIN PolarisTransactions.Polaris.TransactionHeaders TH WITH (NOLOCK)
+        ON TD.TransactionID = TH.TransactionID
+        AND TD.TransactionSubTypeID = 7
+
+    WHERE
+        TH.TransactionTypeID = 6001
+        AND TH.TranClientDate >= DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0)
+        AND TH.TranClientDate < DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0)
+),
+
+ItemPerTransaction AS (
     SELECT
-        th.TransactionID,
-        th.TranClientDate,
+        TD.TransactionID,
+        MIN(TD.NumValue) AS ItemRecordID
+    FROM PolarisTransactions.Polaris.TransactionDetails TD WITH (NOLOCK)
+    WHERE TD.TransactionSubTypeID = 38
+    GROUP BY TD.TransactionID
+),
 
-        MAX(CASE 
-            WHEN td.TransactionSubTypeID = 38 THEN td.numValue 
-        END) AS ItemRecordID,
+BaseData AS (
+    SELECT
+        O.Name AS PatronBranch,
+        PC.Description AS PatronType,
+        IPT.ItemRecordID,
+        ISNULL(CIR.StatisticalCodeID, 7) AS StatisticalCodeID,
+        CASE 
+            WHEN CIR.StatisticalCodeID IS NULL THEN 'NA'
+            ELSE SC.Description
+        END AS StatisticalCode,
 
-        MAX(CASE 
-            WHEN td.TransactionSubTypeID = 6 THEN td.numValue 
-        END) AS PatronID
+        MT.Description AS MaterialType
 
-    FROM PolarisTransactions.Polaris.TransactionHeaders th
-    INNER JOIN PolarisTransactions.Polaris.TransactionTypes tt
-        ON th.TransactionTypeID = tt.TransactionTypeID
-    INNER JOIN PolarisTransactions.Polaris.TransactionDetails td
-        ON th.TransactionID = td.TransactionID
+    FROM BaseTransactions BT
 
-    WHERE tt.TransactionTypeDescription = 'Check Out'
+    LEFT JOIN ItemPerTransaction IPT
+        ON BT.TransactionID = IPT.TransactionID
 
-    GROUP BY th.TransactionID, th.TranClientDate
+    LEFT JOIN Polaris.Polaris.CircItemRecords CIR WITH (NOLOCK)
+        ON IPT.ItemRecordID = CIR.ItemRecordID
+
+    LEFT JOIN Polaris.Polaris.MaterialTypes MT WITH (NOLOCK)
+        ON CIR.MaterialTypeID = MT.MaterialTypeID
+
+    LEFT JOIN Polaris.Polaris.StatisticalCodes SC WITH (NOLOCK)
+        ON CIR.StatisticalCodeID = SC.StatisticalCodeID
+        AND SC.OrganizationID = CIR.AssignedBranchID
+
+    INNER JOIN Polaris.Organizations O WITH (NOLOCK)
+        ON BT.OrganizationID = O.OrganizationID
+
+    INNER JOIN Polaris.PatronCodes PC WITH (NOLOCK)
+        ON PC.PatronCodeID = BT.PatronCodeID
+
+
 )
 
 SELECT
-    o.Name AS PatronBranch,
-    pc.Description AS PatronType,
-    mt.Description AS MaterialType,
-    COUNT(*) AS TotalCheckouts,
+    PatronBranch,
+    PatronType,
+    MaterialType,
+    StatisticalCodeID,
+    StatisticalCode,
+    COUNT(*) AS TotalCheckouts
 
-    SUM(
-        CASE
-            WHEN ird.Price IS NOT NULL AND ird.Price > 0 THEN ird.Price
-            ELSE
-                CASE
-                    WHEN mt.Description LIKE '%Periodical Magazine%' THEN 5.00
-                    WHEN mt.Description LIKE '%Ebook%' 
-                      OR mt.Description LIKE '%Library of Things%'
-                      OR mt.Description LIKE '%E-Audiobook%' THEN 10.00
-                    WHEN mt.Description LIKE '%Microform%' THEN 11.00
-                    WHEN mt.Description LIKE '%Music CD%' THEN 13.00
-                    WHEN mt.Description LIKE '%Graphic Novel%' THEN 14.00
-                    WHEN mt.Description LIKE '%INN-Reach 7 Day%'
-                      OR mt.Description LIKE '%VHS%'
-                      OR mt.Description LIKE '%Map, Atlas%' 
-                      OR mt.Description LIKE '%DVD%' THEN 15.00
-                    WHEN mt.Description LIKE '%Sheet Music%' THEN 16.00
-                    WHEN mt.Description LIKE '%INN-Reach 3 Week%' THEN 18.00
-                    WHEN mt.Description LIKE '%Book%' THEN 18.00
-                    WHEN mt.Description LIKE '%E-Journal%'
-                      OR mt.Description LIKE '%Computer File%'
-                      OR mt.Description LIKE '%Blu-Ray%' THEN 20.00
-                    WHEN mt.Description LIKE '%ILL Item%' THEN 25.00
-                    WHEN mt.Description LIKE '%Video Game%'
-                      OR mt.Description LIKE '%Game%' THEN 30.00
-                    WHEN mt.Description LIKE '%Large Print%' THEN 31.00
-                    WHEN mt.Description LIKE '%Audiobook%' THEN 35.00
-                    WHEN mt.Description LIKE '%Kit%' THEN 48.00
-                    WHEN mt.Description LIKE '%Pass%' THEN 50.00
-                    WHEN mt.Description LIKE '%Equipment%' THEN 90.00
-                    ELSE 10.00
-                END
-        END
-    ) AS EstimatedValueSaved,
-
-    SUM(CASE WHEN ird.Price IS NOT NULL AND ird.Price > 0 THEN 1 ELSE 0 END) AS UsedActualPrice,
-    SUM(CASE WHEN ird.Price IS NULL OR ird.Price = 0 THEN 1 ELSE 0 END) AS UsedEstimatedPrice
-
-FROM TransactionData t
-
-INNER JOIN Polaris.Polaris.CircItemRecords cir
-    ON t.ItemRecordID = cir.ItemRecordID
-
-INNER JOIN Polaris.Polaris.ItemRecordDetails ird
-    ON cir.ItemRecordID = ird.ItemRecordID
-
-INNER JOIN Polaris.Polaris.MaterialTypes mt
-    ON cir.MaterialTypeID = mt.MaterialTypeID
-
-INNER JOIN Polaris.Polaris.Patrons p
-    ON t.PatronID = p.PatronID
-
-INNER JOIN Polaris.Polaris.PatronCodes pc
-    ON p.PatronCodeID = pc.PatronCodeID
-
-INNER JOIN Polaris.Polaris.Organizations o
-    ON p.OrganizationID = o.OrganizationID
-
-WHERE
-    t.ItemRecordID IS NOT NULL
-    AND t.PatronID IS NOT NULL
-    AND mt.MaterialTypeID NOT IN (5,17,21,28,29,34)
-    AND t.TranClientDate >= DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0)
-    AND t.TranClientDate < DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0)
-    AND p.PatronCodeID NOT IN (8,9,10,11,12,23,24,25)
+FROM BaseData
 
 GROUP BY
-    o.Name,
-    pc.Description,
-    mt.Description
+    PatronBranch,
+    PatronType,
+    MaterialType,
+    StatisticalCodeID,
+    StatisticalCode
 
 ORDER BY
-    o.Name,
-    pc.Description,
-    mt.Description;
-        """
-    }
+    PatronBranch,
+    PatronType,
+    MaterialType;
+"""
 
-    # Folder mapping
-    folder_map = {
-        "LibraryUseValue": "/Polaris/Custom/MILS TOP HITS/Library Use Value",
-    }
+    df = run_query(query)
 
-    # Session
+    # Debug visibility
+    print("Row count:", len(df))
+
+    # Remove completely empty rows
+    df = df.dropna(how="all")
+
+    # Clean strings
+    df["MaterialType"] = df["MaterialType"].astype(str).str.strip()
+
+    # Apply pricing
+    df = apply_pricing(df)
+
+    csv_path = os.path.join(REPORTS_DIR, f"LibraryUseValue_{ym}.csv")
+
+    xlsx_path = save_outputs(df, csv_path)
+
     session = requests.Session()
     session.auth = HttpNtlmAuth(USERNAME, PASSWORD)
-    session.headers.update({"Content-Type": "application/json"})
 
-    # Main loop
-    for name, query in queries.items():
-
-        logger.info(f"Processing {name}")
-
-        csv_path = os.path.join(REPORTS_DIR, f"{name}_{ym}.csv")
-
-        run_query(query, csv_path)
-
-        xlsx_path = convert_csv_to_xlsx(csv_path)
-
-        folder = folder_map.get(name)
-
-        if not folder:
-            logger.error(f"No folder mapping found for {name}")
-            continue
-
-        success = upload_file(session, xlsx_path, folder)
-
-        if success:
-            archive_file(csv_path)
-            archive_file(xlsx_path)
-        else:
-            logger.error(f"{name} upload failed")
+    if upload_file(session, xlsx_path, "/Polaris/Custom/MILS TOP HITS/Library Use Value"):
+        archive_file(csv_path)
+        archive_file(xlsx_path)
 
     logger.info("MILS export job completed")
 
+# ----------------------------
 
 if __name__ == "__main__":
     main()
