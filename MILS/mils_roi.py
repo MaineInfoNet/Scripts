@@ -226,7 +226,11 @@ BaseData AS (
             ELSE SC.Description
         END AS StatisticalCode,
 
-        MT.Description AS MaterialType
+        CASE
+            WHEN MT.Description IS NULL
+                THEN 'None - Deleted Item Record'
+            ELSE MT.Description
+        END AS MaterialType
 
     FROM BaseTransactions BT
 
