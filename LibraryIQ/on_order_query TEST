@@ -1,0 +1,22 @@
+SELECT
+    id2reckey(rmb.id)||'a' AS bib_record_num,
+    l.name AS branchCode,
+    COUNT(i.id) AS copies,
+    CURRENT_DATE AS reportDate
+FROM sierra_view.item_record i
+JOIN sierra_view.item_record_property ip
+    ON i.id = ip.item_record_id
+JOIN sierra_view.bib_record_item_record_link bril
+    ON i.id = bril.item_record_id
+JOIN sierra_view.record_metadata rmb
+    ON bril.bib_record_id = rmb.id
+LEFT JOIN sierra_view.location_myuser l
+    ON i.location_code = l.code
+WHERE UPPER(ip.call_number) LIKE '%ON ORDER%'
+    AND i.location_code LIKE 'cml%'
+GROUP BY
+    rmb.id,
+    l.name
+ORDER BY
+    l.name,
+    rmb.id;
