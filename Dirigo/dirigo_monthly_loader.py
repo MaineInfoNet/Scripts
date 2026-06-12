@@ -2,7 +2,7 @@
 # Run in sic
 
 # ---------------------------
-# Dirigo Monthly Export & Upload to PRM
+# Dirigo Monthly Export & Upload to PRM (SSRS)
 # Lynn Uhlman - Maine InfoNet
 # ---------------------------
 
