@@ -16,8 +16,12 @@ import os
 from datetime import datetime
 from datetime import date
 import shutil
+import requests
+import traceback
 
-#logging
+import smtplib
+from email.message import EmailMessage
+
 import logging
 
 logging.basicConfig(
@@ -32,6 +36,15 @@ console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(console)
+
+
+# CONFIG
+config = configparser.RawConfigParser()
+config.read("config.ini")
+
+API_KEY = config["freshdesk"]["api_key"]
+DOMAIN = config["freshdesk"]["domain"]
+BASE_URL = f"https://{DOMAIN}.freshdesk.com/api/v2"
 
 # test mode flag
 TEST_MODE = False        # Set to False for production
@@ -70,45 +83,127 @@ def csv_writer(query_results, headers, csv_file):
     return csv_file
 
 
+# send ticket to FreshDesk support
+def create_failure_ticket(
+    subject,
+    description,
+    group_id=1000161100,
+    priority=1,
+    status=2,
+    tags=None
+):
+
+    payload = {
+        "subject": subject,
+        "description": description,
+        "status": status,
+        "priority": priority,
+        "email": config["freshdesk"]["email"],
+    }
+
+    if group_id:
+        payload["group_id"] = group_id
+
+    if tags:
+        payload["tags"] = tags
+
+    response = requests.post(
+        f"{BASE_URL}/tickets",
+        auth=(API_KEY, "X"),
+        json=payload,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+
+def report_failure(
+    stage, 
+    failure_type, 
+    error, 
+    script="LibraryIQMaineLoader.py", 
+    machine="MINAdministrator (Statistics)", 
+    tags=None):
+    create_failure_ticket(
+        subject=f"LibraryIQ Export Failed - {stage}",
+        description=f"""
+<h3>LibraryIQ Export Failed</h3>
+
+<b>Stage:</b> {stage}<br>
+<b>Failure Type:</b> {failure_type}<br>
+<b>Server:</b> urs2-db.iii.com<br>
+<b>Script:</b> {script}<br>
+<b>Machine:</b> {machine}<br><br>
+
+<b>Error:</b> <pre>{error}</pre>
+
+<b>Traceback:</b> <pre>{traceback.format_exc()}</pre>
+""",
+        tags=tags or ["cat-systems_support", "libraryiq"]
+    )
+    
+    
 # connect to Sierra-db and store results of an sql query
-def run_query(query, csv_file):
+def run_query(query, csv_file, stage):
+    logger.info(f"Starting stage '{stage}'")
+    logger.info(f"Output file: {csv_file}")
 
-    logger.info(f"Starting query for {csv_file}")
-
-    config = configparser.ConfigParser()
-    config.read("config.ini")
+    conn = None
+    cursor = None
 
     try:
+        # ---------------------------
+        # Connect to PostgreSQL
+        # ---------------------------
+        logger.info("Connecting to PostgreSQL...")
         conn = psycopg2.connect(config["sql"]["connection_string"])
-        logger.info("Database connection established")
-    except Exception:
-        logger.exception("Database connection failed")
-        return
+        cursor = conn.cursor()
+        logger.info("Database connection established.")
 
-    cursor = conn.cursor()
+        # ---------------------------
+        # Execute query
+        # ---------------------------
+        safe_query = apply_test_limit(query) if LIMIT_ROWS else query
 
-    safe_query = apply_test_limit(query) if LIMIT_ROWS else query
-
-    try:
+        logger.info("Executing query...")
         cursor.execute(safe_query)
-        headers = [i[0] for i in cursor.description]
+
+        headers = [col[0] for col in cursor.description]
         rows = cursor.fetchall()
-        logger.info(f"Query returned {len(rows)} rows")
-    except Exception:
-        logger.exception("Query execution failed")
-        conn.close()
-        return
 
-    conn.close()
+        logger.info(f"Query returned {len(rows):,} rows.")
 
-    end_file = csv_writer(rows, headers, csv_file)
+    except psycopg2.OperationalError as e:
+        logger.exception("Database connection failed.")
+        report_failure(stage, "Database Connection", e)
+        return None
 
-    logger.info(f"CSV file written: {csv_file}")
+    except Exception as e:
+        logger.exception("SQL execution failed.")
+        report_failure(stage, "SQL Execution", e)
+        return None
 
-    return end_file
+    finally:
+        if cursor:
+            cursor.close()
 
+        if conn:
+            conn.close()
 
-# add a LIMIT to test mode
+        logger.info("Database connection closed.")
+
+    # ---------------------------
+    # Write CSV
+    # ---------------------------
+    try:
+        end_file = csv_writer(rows, headers, csv_file)
+        logger.info(f"CSV written successfully: {end_file}")
+        return end_file
+
+    except Exception as e:
+        logger.exception("CSV write failed.")
+        report_failure(stage, "CSV Write", e)
+        return None
 
 def apply_test_limit(query):
     """
@@ -119,19 +214,26 @@ def apply_test_limit(query):
 
 
 # alt function combining runquery() and csvWriter() to handle full item holdings file
-def run_large_query(csv_file):
+def run_large_query(csv_file, stage):    
     # instantiate offset value for use with query
     offset = 0
     # see runquery() function for config file example
-    config = configparser.ConfigParser()
+    config = configparser.RawConfigParser()
     config.read("config.ini")
 
     try:
         # variable connection string should be defined in the imported config file
         conn = psycopg2.connect(config["sql"]["connection_string"])
-    except Exception:
-        logger.exception("Database connection failed in run_large_query")
-        return
+    except Exception as e:
+        logger.exception("Database connection failed.")
+
+        report_failure(
+            stage=stage,
+            failure_type="Database Connection",
+            error=e
+        )
+
+        return None
 
 
     # Opening a session and querying the database for weekly new items
@@ -213,9 +315,16 @@ def run_large_query(csv_file):
                 cursor.execute(large_items_query)
                 rows = cursor.fetchall()
                 logger.info(f"Batch at OFFSET {offset} returned {len(rows)} rows")
-            except Exception:
-                logger.exception(f"Query failed at OFFSET {offset}")
-                break
+            except Exception as e:
+                logger.exception(f"Query failed at OFFSET {offset:,}")
+
+                report_failure(
+                    stage=f"{stage} (OFFSET {offset:,})",
+                    failure_type="SQL Execution",
+                    error=e
+                )
+
+                return None
 
 
             # first time through the loop, add a header row to the csv file
@@ -240,7 +349,7 @@ def sftp_file(file1):
         logger.info(f"[DEV MODE] Skipping SFTP upload for {file1}")
         return
 
-    config = configparser.ConfigParser()
+    config = configparser.RawConfigParser()
     config.read("config.ini")
 
     host = config["libraryiq"]["host"]
@@ -271,8 +380,16 @@ def sftp_file(file1):
         shutil.move(file1, archive_file)
         logger.info(f"Archived file: {archive_file}")
 
-    except Exception:
+    except Exception as e:
         logger.exception(f"SFTP upload failed for {file1}")
+
+        report_failure(
+            stage=f"SFTP Upload ({os.path.basename(file1)})",
+            failure_type="SFTP Upload",
+            error=e
+        )
+
+        return None
 
 
 
@@ -633,31 +750,62 @@ def main():
     requested_holds_file = os.path.join(REPORTS_DIR, f"Holds_Requested_{export_type}_{today_str}.csv")
     unfilled_holds_file = os.path.join(REPORTS_DIR, f"Holds_Unfilled_{export_type}_{today_str}.csv")
 
-    # for each file, run associated query, populate the file, and sftp it to libraryiq
+    # for each file, run associated query, populate the file, and sftp it to LibraryIQ
+
     # --- HOLDS ---
-    holds_csv = run_query(holds_query, holds_file)
-    if holds_csv:
-       sftp_file(holds_csv)
-    
+    holds_csv = run_query(
+        holds_query,
+        holds_file,
+        "Holds Export"
+    )
+    if not holds_csv:
+        return
+
+    sftp_file(holds_csv)
+
     # --- FULFILLED HOLDS ---
-    fulfilled_holds_csv = run_query(fulfilled_holds_query, fulfilled_holds_file)
-    if fulfilled_holds_csv:
-       sftp_file(fulfilled_holds_csv)
-    
-    # --- REQUESTED HOLDS ---    
-    requested_holds_csv = run_query(requested_holds_query, requested_holds_file)
-    if requested_holds_csv:
-       sftp_file(requested_holds_csv)
-        
+    fulfilled_holds_csv = run_query(
+        fulfilled_holds_query,
+        fulfilled_holds_file,
+        "Fulfilled Holds Export"
+    )
+    if not fulfilled_holds_csv:
+        return
+
+    sftp_file(fulfilled_holds_csv)
+
+    # --- REQUESTED HOLDS ---
+    requested_holds_csv = run_query(
+        requested_holds_query,
+        requested_holds_file,
+        "Requested Holds Export"
+    )
+    if not requested_holds_csv:
+        return
+
+    sftp_file(requested_holds_csv)
+
     # --- UNFILLED HOLDS ---
-    unfilled_holds_csv = run_query(unfilled_holds_query, unfilled_holds_file)
-    if unfilled_holds_csv:
-       sftp_file(unfilled_holds_csv)
-        
+    unfilled_holds_csv = run_query(
+        unfilled_holds_query,
+        unfilled_holds_file,
+        "Unfilled Holds Export"
+    )
+    if not unfilled_holds_csv:
+        return
+
+    sftp_file(unfilled_holds_csv)
+
     # --- CIRC ---
-    circ_csv = run_query(circ_query, circ_file)
-    if circ_csv:
-       sftp_file(circ_csv)
+    circ_csv = run_query(
+        circ_query,
+        circ_file,
+        "Circulation Export"
+    )
+    if not circ_csv:
+        return
+
+    sftp_file(circ_csv)
 
     # --- ITEMS ---
     if TEST_MODE:
@@ -665,41 +813,70 @@ def main():
     else:
         if RUN_FULL_EXPORT:
             logger.info("Running full items export")
-            items_csv = run_large_query(items_file)
+            items_csv = run_large_query(
+                items_file,
+                "Item Full Export"
+            )
         else:
             logger.info("Running delta items export")
-            items_csv = run_query(items_query, items_file)
+            items_csv = run_query(
+                items_query,
+                items_file,
+                "Item Delta Export"
+            )
 
-        if items_csv:
-           sftp_file(items_csv)
+        if not items_csv:
+            return
+
+        sftp_file(items_csv)
 
     # --- BIBS ---
     if TEST_MODE:
         logger.info("[TEST MODE] Skipping bibs query")
     else:
         if RUN_FULL_EXPORT:
-           logger.info("Running full bib export")
-           bibs_csv = run_query(bibs_query_full, bibs_file)
+            logger.info("Running full bib export")
+            bibs_csv = run_query(
+                bibs_query_full,
+                bibs_file,
+                "Bibliographic Full Export"
+            )
         else:
-           logger.info("Running delta bib export")
-           bibs_csv = run_query(bibs_query_delta, bibs_file)
+            logger.info("Running delta bib export")
+            bibs_csv = run_query(
+                bibs_query_delta,
+                bibs_file,
+                "Bibliographic Delta Export"
+            )
 
-        if bibs_csv:
-           sftp_file(bibs_csv)
+        if not bibs_csv:
+            return
+
+        sftp_file(bibs_csv)
 
     # --- PATRONS ---
     if TEST_MODE:
         logger.info("[TEST MODE] Skipping patrons query")
     else:
         if RUN_FULL_EXPORT:
-           logger.info("Running full patrons export")
-           patrons_csv = run_query(patrons_query_full, patrons_file)
+            logger.info("Running full patrons export")
+            patrons_csv = run_query(
+                patrons_query_full,
+                patrons_file,
+                "Patron Full Export"
+            )
         else:
-           logger.info("Running delta patrons export")
-           patrons_csv = run_query(patrons_query_delta, patrons_file)
+            logger.info("Running delta patrons export")
+            patrons_csv = run_query(
+                patrons_query_delta,
+                patrons_file,
+                "Patron Delta Export"
+            )
 
-        if patrons_csv:
-           sftp_file(patrons_csv)
+        if not patrons_csv:
+            return
+
+        sftp_file(patrons_csv)
 
     logger.info("LibraryIQ export job completed")
 
