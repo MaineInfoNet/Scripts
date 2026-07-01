@@ -693,4 +693,3 @@ def main():
     logger.info("LibraryIQ export job completed")
 
 main()
-
