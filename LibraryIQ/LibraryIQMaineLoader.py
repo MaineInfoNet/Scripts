@@ -15,6 +15,7 @@ import paramiko
 import os
 from datetime import datetime
 from datetime import date
+import shutil
 
 #logging
 import logging
@@ -53,6 +54,10 @@ REPORTS_DIR = os.path.join(BASE_DIR, "Reports")
 
 # Create Reports directory if it doesn't exist
 os.makedirs(REPORTS_DIR, exist_ok=True)
+
+# Archive uploaded files instead of deleting them right away
+ARCHIVE_DIR = os.path.join(REPORTS_DIR, "Archive")
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 # populate csv file with results of a sql query
 def csv_writer(query_results, headers, csv_file):
@@ -258,7 +263,13 @@ def sftp_file(file1):
         sftp.close()
         transport.close()
 
-        os.remove(file1)
+        archive_file = os.path.join(
+            ARCHIVE_DIR,
+            os.path.basename(file1)
+        )
+
+        shutil.move(file1, archive_file)
+        logger.info(f"Archived file: {archive_file}")
 
     except Exception:
         logger.exception(f"SFTP upload failed for {file1}")
