@@ -356,29 +356,29 @@ def sftp_file(file1):
     username = config["libraryiq"]["user"]
     password = config["libraryiq"]["pw"]
 
+    transport = None
+    sftp = None
+
     try:
+        # Connect to SFTP
         transport = paramiko.Transport((host, 22))
         transport.connect(username=username, password=password)
 
         sftp = paramiko.SFTPClient.from_transport(transport)
+
         remote_filename = os.path.basename(file1)
         remote_path = f"/upload/{remote_filename}"
 
-        sftp.put(file1, remote_path)
+        logger.info(f"Uploading {file1} to {remote_path}")
 
+        # LibraryIQ immediately processes and moves uploaded files,
+        # so disable Paramiko's post-upload confirmation.
+        sftp.put(file1, remote_path, confirm=False)
 
-        logger.info(f"SFTP upload successful: {file1}")
-
-        sftp.close()
-        transport.close()
-
-        archive_file = os.path.join(
-            ARCHIVE_DIR,
-            os.path.basename(file1)
+        logger.info(
+            f"SFTP upload successful: {file1} "
+            "(confirmation disabled because LibraryIQ immediately processes uploaded files)"
         )
-
-        shutil.move(file1, archive_file)
-        logger.info(f"Archived file: {archive_file}")
 
     except Exception as e:
         logger.exception(f"SFTP upload failed for {file1}")
@@ -390,6 +390,43 @@ def sftp_file(file1):
         )
 
         return None
+
+    finally:
+        # Always close the SFTP connection
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+    # Archive the file after a successful upload
+    archive_file = os.path.join(
+        ARCHIVE_DIR,
+        os.path.basename(file1)
+    )
+
+    try:
+        shutil.move(file1, archive_file)
+        logger.info(f"Archived file: {archive_file}")
+
+    except Exception as e:
+        logger.exception(f"Uploaded successfully but failed to archive {file1}")
+
+        report_failure(
+            stage=f"Archive ({os.path.basename(file1)})",
+            failure_type="Archive",
+            error=e
+        )
+
+        return None
+
+    return archive_file
 
 
 
@@ -734,7 +771,33 @@ def main():
       AND h.status = '0'
     """
 
-    
+    on_order_query = """\
+    SELECT
+        id2reckey(rmb.id)||'a' AS bib_record_num,
+        l.name AS branchCode,
+        COUNT(i.id) AS copies,
+        CURRENT_DATE AS reportDate
+    FROM sierra_view.item_record i
+    JOIN sierra_view.item_record_property ip
+        ON i.id = ip.item_record_id
+    JOIN sierra_view.bib_record_item_record_link bril
+        ON i.id = bril.item_record_id
+    JOIN sierra_view.record_metadata rmb
+        ON bril.bib_record_id = rmb.id
+    LEFT JOIN sierra_view.location_myuser l
+        ON i.location_code = l.code
+    WHERE UPPER(ip.call_number) LIKE '%ON ORDER%'
+        AND i.location_code LIKE 'cml%'
+    GROUP BY
+        rmb.id,
+        l.name
+    ORDER BY
+        l.name,
+        rmb.id;
+    """
+
+
+
     # Define Full versus Delta
     export_type = "Full" if RUN_FULL_EXPORT else "Delta"
     logger.info(f"Export type for this run: {export_type}")
@@ -749,8 +812,21 @@ def main():
     fulfilled_holds_file = os.path.join(REPORTS_DIR, f"Holds_Fulfilled_{export_type}_{today_str}.csv")
     requested_holds_file = os.path.join(REPORTS_DIR, f"Holds_Requested_{export_type}_{today_str}.csv")
     unfilled_holds_file = os.path.join(REPORTS_DIR, f"Holds_Unfilled_{export_type}_{today_str}.csv")
+    on_order_file = os.path.join(REPORTS_DIR, f"On_Order_{export_type}_{today_str}.csv")
 
     # for each file, run associated query, populate the file, and sftp it to LibraryIQ
+
+    # --- ON ORDER ---
+    on_order_csv = run_query(
+        on_order_query,
+        on_order_file,
+        "On Order Export"
+    )
+    if not on_order_csv:
+        return
+
+    sftp_file(on_order_csv)    
+    
 
     # --- HOLDS ---
     holds_csv = run_query(
@@ -762,6 +838,7 @@ def main():
         return
 
     sftp_file(holds_csv)
+    
 
     # --- FULFILLED HOLDS ---
     fulfilled_holds_csv = run_query(
@@ -774,6 +851,7 @@ def main():
 
     sftp_file(fulfilled_holds_csv)
 
+
     # --- REQUESTED HOLDS ---
     requested_holds_csv = run_query(
         requested_holds_query,
@@ -784,6 +862,7 @@ def main():
         return
 
     sftp_file(requested_holds_csv)
+
 
     # --- UNFILLED HOLDS ---
     unfilled_holds_csv = run_query(
@@ -806,6 +885,7 @@ def main():
         return
 
     sftp_file(circ_csv)
+
 
     # --- ITEMS ---
     if TEST_MODE:
@@ -830,6 +910,7 @@ def main():
 
         sftp_file(items_csv)
 
+
     # --- BIBS ---
     if TEST_MODE:
         logger.info("[TEST MODE] Skipping bibs query")
@@ -853,6 +934,7 @@ def main():
             return
 
         sftp_file(bibs_csv)
+
 
     # --- PATRONS ---
     if TEST_MODE:
