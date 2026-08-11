@@ -774,7 +774,7 @@ def main():
     on_order_query = """\
     SELECT
         id2reckey(rmb.id)||'a' AS bib_record_num,
-        l.name AS branchCode,
+        SUBSTRING(i.location_code,1,3) AS "itemLocation",
         COUNT(i.id) AS copies,
         CURRENT_DATE AS reportDate
     FROM sierra_view.item_record i
@@ -784,15 +784,13 @@ def main():
         ON i.id = bril.item_record_id
     JOIN sierra_view.record_metadata rmb
         ON bril.bib_record_id = rmb.id
-    LEFT JOIN sierra_view.location_myuser l
-        ON i.location_code = l.code
     WHERE UPPER(ip.call_number) LIKE '%ON ORDER%'
         AND i.location_code LIKE 'cml%'
     GROUP BY
         rmb.id,
-        l.name
+        i.location_code
     ORDER BY
-        l.name,
+        i.location_code,
         rmb.id;
     """
 
