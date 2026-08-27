@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 
+
+# ---------------------------
+# UMSL - MSCC Review
+# Lynn Uhlman - Maine InfoNet
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# compares spreadsheet of 
+# titles from another library
+# to the UMSL collection.
+# ---------------------------
+
 import sys
 from pathlib import Path
 
 import pandas as pd
-
 
 # ------------------------------------------------------------
 # Script paths
